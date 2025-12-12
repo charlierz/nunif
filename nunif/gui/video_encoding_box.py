@@ -20,15 +20,15 @@ PRESET_ALL = list(dict.fromkeys(PRESET_LIBX264 + PRESET_NVENC))
 
 CODEC_ALL = ["libx264", "libopenh264", "libx265", "h264_nvenc", "hevc_nvenc", "utvideo", "ffv1"]
 
-PIX_FMT_ALL = ["yuv420p", "yuv444p", "yuv420p10le", "rgb24", "gbrp10le", "gbrp16le"]
+PIX_FMT_ALL = ["yuv420p", "yuv422p", "yuv444p", "yuv420p10le", "rgb24", "gbrp10le", "gbrp16le"]
 CODEC_PIX_FMT = {
-    "libx264": ["yuv420p", "yuv444p", "yuv420p10le", "rgb24", "gbrp10le"],
-    "libx265": ["yuv420p", "yuv444p", "yuv420p10le", "rgb24", "gbrp10le"],
-    "h264_nvenc": ["yuv420p", "yuv444p", "yuv420p10le", "rgb24", "gbrp16le"],
-    "hevc_nvenc": ["yuv420p", "yuv444p", "yuv420p10le", "rgb24", "gbrp16le"],
+    "libx264": ["yuv420p", "yuv422p", "yuv444p", "yuv420p10le", "rgb24", "gbrp10le"],
+    "libx265": ["yuv420p", "yuv422p", "yuv444p", "yuv420p10le", "rgb24", "gbrp10le"],
+    "h264_nvenc": ["yuv420p", "yuv422p", "yuv444p", "yuv420p10le", "rgb24", "gbrp16le"],
+    "hevc_nvenc": ["yuv420p", "yuv422p", "yuv444p", "yuv420p10le", "rgb24", "gbrp16le"],
     "libopenh264": ["yuv420p"],
-    "utvideo": ["yuv420p", "yuv444p", "rgb24"],
-    "ffv1": ["yuv420p", "yuv444p", "yuv420p10le", "rgb24", "gbrp16le"],
+    "utvideo": ["yuv420p", "yuv422p", "yuv444p", "rgb24"],
+    "ffv1": ["yuv420p", "yuv422p", "yuv444p", "yuv420p10le", "rgb24", "gbrp16le"],
 }
 
 
