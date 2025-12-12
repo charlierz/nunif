@@ -1,5 +1,6 @@
 import os
 from os import path
+import av
 import warnings
 import numpy as np
 import torch
@@ -453,7 +454,7 @@ def debug_depth_image(depth, args):
     return out
 
 
-def process_image(x, args, depth_model, side_model):
+def process_image(x, args, depth_model, side_model, return_depth=False):
     assert depth_model.get_ema_buffer_size() == 1
 
     with torch.inference_mode():
@@ -465,10 +466,14 @@ def process_image(x, args, depth_model, side_model):
         depth = depth_model.minmax_normalize_chw(depth)
 
         if args.debug_depth:
+            if return_depth:
+                return debug_depth_image(depth, args), depth
             return debug_depth_image(depth, args)
         elif args.rgbd or args.half_rgbd:
             left_eye, right_eye = apply_rgbd(x, depth, mapper=args.mapper)
             sbs = postprocess_image(left_eye, right_eye, args)
+            if return_depth:
+                return sbs, depth
             return sbs
         else:
             while True:
@@ -481,6 +486,9 @@ def process_image(x, args, depth_model, side_model):
                 sbs = postprocess_image(left_eye[0], right_eye[0], args)
             else:
                 sbs = postprocess_image(left_eye, right_eye, args)
+            
+            if return_depth:
+                return sbs, depth
             return sbs
 
 
@@ -589,8 +597,13 @@ def bind_single_frame_callback(depth_model, side_model, segment_pts, args):
                     # debug red line
                     o[0, 0:8, :] = 1.0
 
-            for o in out:
-                frames.append(VU.to_frame(o, use_16bit=use_16bit))
+            if args.video_depth:
+                depth_vis = depth.repeat(3, 1, 1)
+                for o in out:
+                    frames.append((VU.to_frame(o, use_16bit=use_16bit), VU.to_frame(depth_vis, use_16bit=use_16bit)))
+            else:
+                for o in out:
+                    frames.append(VU.to_frame(o, use_16bit=use_16bit))
 
         if flush and hasattr(side_model, "flush"):
             left_eye, right_eye = side_model.flush(enable_amp=not args.disable_amp)
@@ -690,9 +703,16 @@ def bind_batch_frame_callback(depth_model, side_model, segment_pts, args):
                     else:
                         left_eyes, right_eyes = apply_divergence(depths, x_srcs, args, side_model)
 
-            frames = [postprocess_image(left_eyes[i], right_eyes[i], args)
-                      for i in range(left_eyes.shape[0])]
-            results += [VU.to_frame(frame, use_16bit=use_16bit) for frame in frames]
+            if args.video_depth:
+                for i in range(left_eyes.shape[0]):
+                    sbs = postprocess_image(left_eyes[i], right_eyes[i], args)
+                    depth = depths[i].repeat(3, 1, 1)
+                    results.append((VU.to_frame(sbs, use_16bit=use_16bit),
+                                    VU.to_frame(depth, use_16bit=use_16bit)))
+            else:
+                frames = [postprocess_image(left_eyes[i], right_eyes[i], args)
+                          for i in range(left_eyes.shape[0])]
+                results += [VU.to_frame(frame, use_16bit=use_16bit) for frame in frames]
 
         return results
 
@@ -767,6 +787,7 @@ def bind_vda_frame_callback(depth_model, side_model, segment_pts, args):
     pts_queue = []
     depth_model.reset()
     use_16bit = VU.pix_fmt_requires_16bit(args.pix_fmt)
+    depth_queue = []
 
     def _postprocess(depth_list, flush=False):
         results = []
@@ -785,21 +806,41 @@ def bind_vda_frame_callback(depth_model, side_model, segment_pts, args):
                 x_srcs = [x for x, _ in x_pts]
                 x_srcs = torch.stack(x_srcs).to(args.state["device"]).permute(0, 3, 1, 2)
                 x_srcs = x_srcs / torch.iinfo(x_srcs.dtype).max
+                
+                if args.video_depth:
+                     for d in depths:
+                         depth_queue.append(d)
+
                 if args.rgbd or args.half_rgbd:
                     left_eyes, right_eyes = apply_rgbd(x_srcs, depths, mapper=args.mapper)
                 else:
                     left_eyes, right_eyes = apply_divergence(depths, x_srcs, args, side_model, reset_pts=reset_pts)
+                
                 if left_eyes is not None:
-                    frames = [postprocess_image(left_eyes[i], right_eyes[i], args)
-                              for i in range(left_eyes.shape[0])]
-                    results += [VU.to_frame(frame, use_16bit=use_16bit) for frame in frames]
+                    if args.video_depth:
+                        for i in range(left_eyes.shape[0]):
+                             sbs = postprocess_image(left_eyes[i], right_eyes[i], args)
+                             d = depth_queue.pop(0).repeat(3, 1, 1)
+                             results.append((VU.to_frame(sbs, use_16bit=use_16bit),
+                                             VU.to_frame(d, use_16bit=use_16bit)))
+                    else:
+                        frames = [postprocess_image(left_eyes[i], right_eyes[i], args)
+                                  for i in range(left_eyes.shape[0])]
+                        results += [VU.to_frame(frame, use_16bit=use_16bit) for frame in frames]
 
         if flush and hasattr(side_model, "flush"):
             left_eyes, right_eyes = side_model.flush(enable_amp=not args.disable_amp)
             if left_eyes is not None:
-                for left_eye, right_eye in zip(left_eyes, right_eyes):
-                    out = postprocess_image(left_eye, right_eye, args)
-                    results.append(VU.to_frame(out, use_16bit=use_16bit))
+                if args.video_depth:
+                    for left_eye, right_eye in zip(left_eyes, right_eyes):
+                        out = postprocess_image(left_eye, right_eye, args)
+                        d = depth_queue.pop(0).repeat(3, 1, 1)
+                        results.append((VU.to_frame(out, use_16bit=use_16bit),
+                                        VU.to_frame(d, use_16bit=use_16bit)))
+                else:
+                    for left_eye, right_eye in zip(left_eyes, right_eyes):
+                        out = postprocess_image(left_eye, right_eye, args)
+                        results.append(VU.to_frame(out, use_16bit=use_16bit))
 
         return results
 
@@ -839,7 +880,7 @@ def bind_vda_frame_callback(depth_model, side_model, segment_pts, args):
                 edge_dilation=args.edge_dilation,
                 depth_aa=args.depth_aa)
             results += _postprocess(depth_list, flush=True)
-            return [VU.to_frame(new_frame, use_16bit=use_16bit) for new_frame in results]
+            return results
 
         frame_hwc = torch.from_numpy(VU.to_ndarray(frame))
         batch_queue.append(frame_hwc)
@@ -847,7 +888,7 @@ def bind_vda_frame_callback(depth_model, side_model, segment_pts, args):
 
         if len(batch_queue) == args.batch_size:
             results = _batch_infer()
-            return [VU.to_frame(new_frame, use_16bit=use_16bit) for new_frame in results]
+            return results
         else:
             return None
 
@@ -859,6 +900,288 @@ def try_compile_context(side_model, enabled):
         return side_model.compile_context()
     else:
         return contextlib.nullcontext()
+
+
+class DualFrameCallbackPool(VU.FrameCallbackPool):
+    def get_results(self, future):
+        results = future.result()
+        if self.postprocess_callback is not None:
+            results = self.postprocess_callback(results)
+
+        if results is not None:
+            processed = []
+            for sbs, depth in results:
+                processed.append((
+                    VU.to_frame(sbs, use_16bit=self.use_16bit),
+                    VU.to_frame(depth, use_16bit=self.use_16bit)
+                ))
+            return processed
+        else:
+            return []
+
+
+def process_video_dual(input_path, output_path,
+                       frame_callback,
+                       config_callback=VU.default_config_callback,
+                       title=None,
+                       vf="",
+                       stop_event=None, suspend_event=None, tqdm_fn=None,
+                       start_time=None, end_time=None,
+                       test_callback=None):
+    if isinstance(start_time, str):
+        start_time = VU.parse_time(start_time)
+    if isinstance(end_time, str):
+        end_time = VU.parse_time(end_time)
+        if start_time is not None and not (start_time < end_time):
+            raise ValueError("end_time must be greater than start_time")
+
+    output_path_tmp = path.join(path.dirname(output_path), "_tmp_" + path.basename(output_path))
+    depth_output_path = path.splitext(output_path)[0] + "_depth.mp4"
+    depth_output_path_tmp = path.join(path.dirname(depth_output_path), "_tmp_" + path.basename(depth_output_path))
+
+    input_container = av.open(input_path)
+    if input_container.duration:
+        container_duration = float(input_container.duration / av.time_base)
+    else:
+        container_duration = None
+
+    if len(input_container.streams.video) == 0:
+        raise ValueError("No video stream")
+
+    if start_time is not None:
+        input_container.seek(start_time * av.time_base, backward=True, any_frame=False)
+
+    video_input_stream = input_container.streams.video[0]
+    video_input_stream.thread_type = "AUTO"
+
+    audio_input_stream = None
+    if len(input_container.streams.audio) > 0:
+        audio_input_stream = input_container.streams.audio[0]
+
+    config = config_callback(video_input_stream)
+    config.fps = VU.convert_known_fps(config.fps)
+    config.output_fps = VU.convert_known_fps(config.output_fps)
+
+    if not config.container_format:
+        config.container_format = path.splitext(output_path)[-1].lower()[1:]
+    if not config.video_codec:
+        config.video_codec = VU.get_default_video_codec(config.container_format)
+    VU.configure_video_codec(config)
+
+    # Main output container
+    output_container = av.open(output_path_tmp, 'w', options=config.container_options)
+    # Depth output container (assume same options for now, but maybe different codec)
+    depth_output_container = av.open(depth_output_path_tmp, 'w', options=config.container_options)
+
+    fps_filter = VU.FixedFPSFilter(video_input_stream, fps=config.fps, vf=vf)
+    
+    # Test output size using test_callback (returns both sbs and depth)
+    # We need to wrap result logic
+    if test_callback is None:
+        test_callback = frame_callback
+    
+    # Custom test_output_size for dual
+    # We call test_callback and expect (sbs, depth)
+    video_filter_test = VU.FixedFPSFilter(video_input_stream, fps=60, vf=vf, deny_filters=VU.SIZE_SAFE_FILTERS)
+    empty_image = Image.new("RGB", (video_input_stream.codec_context.width,
+                                    video_input_stream.codec_context.height), (128, 128, 128))
+    test_frame = av.video.frame.VideoFrame.from_image(empty_image).reformat(
+        format=video_input_stream.pix_fmt,
+        src_color_range=av.video.reformatter.ColorRange.JPEG, dst_color_range=video_input_stream.codec_context.color_range)
+    test_frame.pts = int((1. / video_input_stream.time_base) / 30) or 1
+    
+    try_count = 0
+    output_size = None
+    depth_output_size = None
+    
+    while True:
+        while True:
+            frame = video_filter_test.update(test_frame)
+            test_frame.pts = (test_frame.pts + test_frame.pts)
+            if frame is not None:
+                break
+            try_count += 1
+            if try_count * video_input_stream.codec_context.width * video_input_stream.codec_context.height * 3 > 2000 * 1024 * 1024:
+                raise RuntimeError("Unable to estimate output size of video filter")
+        
+        output_frames = VU.get_new_frames(test_callback(frame))
+        if output_frames:
+            sbs_frame, depth_frame = output_frames[0]
+            output_size = sbs_frame.width, sbs_frame.height
+            depth_output_size = depth_frame.width, depth_frame.height
+            break
+
+    if output_size is None or depth_output_size is None:
+        raise RuntimeError("Failed to determine output size")
+
+    output_fps = config.output_fps or config.fps
+    
+    # Setup Main Stream
+    video_output_stream = output_container.add_stream(config.video_codec, output_fps)
+    VU.configure_colorspace(video_output_stream, video_input_stream, config)
+    video_output_stream.thread_type = "AUTO"
+    video_output_stream.pix_fmt = config.pix_fmt
+    video_output_stream.width = output_size[0]
+    video_output_stream.height = output_size[1]
+    video_output_stream.options = config.options
+    
+    # Setup Depth Stream
+    # Use same codec and settings
+    depth_output_stream = depth_output_container.add_stream(config.video_codec, output_fps)
+    # Reuse config but changing size
+    VU.configure_colorspace(depth_output_stream, video_input_stream, config)
+    depth_output_stream.thread_type = "AUTO"
+    depth_output_stream.pix_fmt = config.pix_fmt
+    depth_output_stream.width = depth_output_size[0]
+    depth_output_stream.height = depth_output_size[1]
+    depth_output_stream.options = config.options
+
+    rgb24_options = config.state["rgb24_options"]
+    reformatter_main = config.state["reformatter"]
+    # We need a secondary reformatter for depth stream (same settings)
+    reformatter_depth = config.state["reformatter"] # lambda that captures closure vars, correct?
+    # Actually `configure_colorspace` modifies `config.state["reformatter"]`.
+    # It depends on output_stream context (dst_colorspace etc). 
+    # Since we set main stream and depth stream identically (same config used in configure_colorspace called twice?), 
+    # NO. `configure_colorspace` sets the lambda based on `output_stream.codec_context`.
+    # If we call it for `depth_output_stream`, it will update `config.state["reformatter"]` to point to depth stream context.
+    # So we need to capture `reformatter_main` BEFORE configuring depth stream, or make sure they are compatible.
+    # Since they have same settings, the lambda should work for both IF it doesn't close over `output_stream` instance but values.
+    # Looking at `configure_colorspace`:
+    # reformatter = lambda frame: frame.reformat(..., dst_colorspace=output_stream.codec_context.colorspace, ...)
+    # It uses `output_stream`! So we need two reformatters.
+    
+    # Re-setup reformatter for depth. config.state is overwritten.
+    # So we save `reformatter_main` first.
+    # Actually I realized I called `configure_colorspace` twice above with `config`.
+    # First for `video_output_stream`. config.state contains main reformatter.
+    reformatter_main = config.state["reformatter"]
+    
+    # Second for `depth_output_stream`. config.state updated.
+    reformatter_depth = config.state["reformatter"]
+
+    # Audio for main stream
+    audio_output_stream = None
+    default_acodec = "aac"
+    audio_copy = False
+    
+    if audio_input_stream is not None:
+        if audio_input_stream.rate < 16000:
+            audio_output_stream = output_container.add_stream(default_acodec, 16000)
+        elif start_time is not None:
+            audio_output_stream = output_container.add_stream(default_acodec, audio_input_stream.rate)
+        else:
+            if VU.test_audio_copy(input_path, output_path_tmp): # Check tmp path? Or original?
+                 audio_output_stream = VU.add_stream_from_template(output_container, template=audio_input_stream)
+                 audio_copy = True
+            else:
+                 audio_output_stream = output_container.add_stream(default_acodec, audio_input_stream.rate)
+
+    desc = (title if title else input_path)
+    ncols = len(desc) + 60
+    tqdm_fn = tqdm_fn or tqdm
+    total = VU.guess_frames(video_input_stream, output_fps, start_time=start_time, end_time=end_time,
+                             container_duration=container_duration)
+    pbar = tqdm_fn(desc=desc, total=total, ncols=ncols)
+    streams = [s for s in [video_input_stream, audio_input_stream] if s is not None]
+
+    try:
+        for packet in input_container.demux(streams):
+            if packet.pts is not None:
+                if end_time is not None and packet.stream.type == "video" and end_time < packet.pts * packet.time_base:
+                    break
+            if packet.stream.type == "video":
+                for frame in VU.safe_decode(packet):
+                    frame = fps_filter.update(frame)
+                    if frame is not None:
+                        frame = frame.reformat(**rgb24_options) if rgb24_options else frame
+                        # frame_callback returns list of (sbs, depth)
+                        for new_frames in VU.get_new_frames(frame_callback(frame)):
+                            # new_frames is (sbs, depth)
+                            sbs_frame, depth_frame = new_frames
+                            
+                            sbs_frame = reformatter_main(sbs_frame)
+                            enc_packet = video_output_stream.encode(sbs_frame)
+                            if enc_packet:
+                                output_container.mux(enc_packet)
+
+                            depth_frame = reformatter_depth(depth_frame)
+                            enc_packet = depth_output_stream.encode(depth_frame)
+                            if enc_packet:
+                                depth_output_container.mux(enc_packet)
+                                
+                            pbar.update(1)
+
+            elif packet.stream.type == "audio" and audio_output_stream:
+                if packet.dts is not None:
+                    if audio_copy:
+                        packet.stream = audio_output_stream
+                        output_container.mux(packet)
+                    else:
+                        for frame in VU.safe_decode(packet):
+                            frame.pts = None
+                            enc_packet = audio_output_stream.encode(frame)
+                            if enc_packet:
+                                output_container.mux(enc_packet)
+            if suspend_event is not None:
+                suspend_event.wait()
+            if stop_event is not None and stop_event.is_set():
+                break
+
+        while True:
+            frame = fps_filter.update(None)
+            if frame is not None:
+                frame = frame.reformat(**rgb24_options) if rgb24_options else frame
+                for new_frames in VU.get_new_frames(frame_callback(frame)):
+                    sbs_frame, depth_frame = new_frames
+                    sbs_frame = reformatter_main(sbs_frame)
+                    enc_packet = video_output_stream.encode(sbs_frame)
+                    if enc_packet:
+                        output_container.mux(enc_packet)
+
+                    depth_frame = reformatter_depth(depth_frame)
+                    enc_packet = depth_output_stream.encode(depth_frame)
+                    if enc_packet:
+                        depth_output_container.mux(enc_packet)
+
+                    pbar.update(1)
+            else:
+                break
+        
+        # Flush frame callback
+        for new_frames in VU.get_new_frames(frame_callback(None)):
+             sbs_frame, depth_frame = new_frames
+             sbs_frame = reformatter_main(sbs_frame)
+             enc_packet = video_output_stream.encode(sbs_frame)
+             if enc_packet:
+                 output_container.mux(enc_packet)
+
+             depth_frame = reformatter_depth(depth_frame)
+             enc_packet = depth_output_stream.encode(depth_frame)
+             if enc_packet:
+                 depth_output_container.mux(enc_packet)
+             pbar.update(1)
+
+        # Flush encoders
+        packet = video_output_stream.encode(None)
+        if packet:
+            output_container.mux(packet)
+            
+        packet = depth_output_stream.encode(None)
+        if packet:
+            depth_output_container.mux(packet)
+
+    finally:
+        pbar.close()
+        output_container.close()
+        depth_output_container.close()
+        input_container.close()
+
+    if not (stop_event is not None and stop_event.is_set()):
+        if path.exists(output_path_tmp):
+            VU.try_replace(output_path_tmp, output_path)
+        if path.exists(depth_output_path_tmp):
+            VU.try_replace(depth_output_path_tmp, depth_output_path)
 
 
 def process_video_full(input_filename, output_path, args, depth_model, side_model):
@@ -940,7 +1263,16 @@ def process_video_full(input_filename, output_path, args, depth_model, side_mode
         decay, buffer_size = depth_model.get_ema_state()
         depth_model.disable_ema()
         x = VU.to_tensor(frame, device=args.state["device"])
-        x = process_image(x, args, depth_model, side_model)
+        if args.video_depth:
+            x, depth = process_image(x, args, depth_model, side_model, return_depth=True)
+            depth = depth.repeat(3, 1, 1)
+            output = [
+                (VU.to_frame(x, use_16bit=use_16bit), VU.to_frame(depth, use_16bit=use_16bit))
+            ]
+        else:
+            x = process_image(x, args, depth_model, side_model)
+            output = VU.to_frame(x, use_16bit=use_16bit)
+
         if ema_normalize:
             # reset ema to avoid affecting test frames
             depth_model.enable_ema(decay=decay, buffer_size=buffer_size)
@@ -948,11 +1280,18 @@ def process_video_full(input_filename, output_path, args, depth_model, side_mode
         if side_model is not None and hasattr(side_model, "reset"):
             side_model.reset()
 
-        return VU.to_frame(x, use_16bit=use_16bit)
+        return output
+
+    if args.video_depth:
+        process_video_func = process_video_dual
+        FrameCallbackPoolClass = DualFrameCallbackPool
+    else:
+        process_video_func = VU.process_video
+        FrameCallbackPoolClass = VU.FrameCallbackPool
 
     if is_video_depth_anything:
         with depth_model.compile_context(enabled=args.compile), try_compile_context(side_model, enabled=args.compile):
-            VU.process_video(input_filename, output_filename,
+            process_video_func(input_filename, output_filename,
                              config_callback=config_callback,
                              frame_callback=bind_vda_frame_callback(
                                  depth_model=depth_model,
@@ -971,7 +1310,7 @@ def process_video_full(input_filename, output_path, args, depth_model, side_mode
 
     elif args.low_vram or args.debug_depth or is_video_depth_anything_streaming or is_inpaint_model:
         with depth_model.compile_context(enabled=args.compile), try_compile_context(side_model, enabled=args.compile):
-            VU.process_video(input_filename, output_filename,
+            process_video_func(input_filename, output_filename,
                              config_callback=config_callback,
                              frame_callback=bind_single_frame_callback(
                                  depth_model=depth_model,
@@ -997,7 +1336,7 @@ def process_video_full(input_filename, output_path, args, depth_model, side_mode
             segment_pts=segment_pts,
             args=args
         )
-        frame_callback = VU.FrameCallbackPool(
+        frame_callback = FrameCallbackPoolClass(
             frame_callback=frame_callback,
             preprocess_callback=preprocess_callback,
             batch_size=minibatch_size,
@@ -1010,7 +1349,7 @@ def process_video_full(input_filename, output_path, args, depth_model, side_mode
         )
         try:
             with depth_model.compile_context(enabled=args.compile):
-                VU.process_video(input_filename, output_filename,
+                process_video_func(input_filename, output_filename,
                                  config_callback=config_callback,
                                  frame_callback=frame_callback,
                                  test_callback=test_callback,
@@ -1869,6 +2208,8 @@ def create_parser(required_true=True):
                               "this means applying --mapper and --foreground-scale."))
     parser.add_argument("--export-depth-only", action="store_true",
                         help=("output only depth image and omits rgb image"))
+    parser.add_argument("--video-depth", action="store_true",
+                        help="output depth video alongside the main video")
     parser.add_argument("--export-depth-fit", action="store_true",
                         help=("fit depth image size to rgb image"))
     parser.add_argument("--mapper", type=str,
