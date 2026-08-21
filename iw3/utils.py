@@ -936,7 +936,7 @@ def process_video_dual(input_path, output_path,
             raise ValueError("end_time must be greater than start_time")
 
     output_path_tmp = path.join(path.dirname(output_path), "_tmp_" + path.basename(output_path))
-    depth_output_path = path.splitext(output_path)[0] + "_depth.mp4"
+    depth_output_path = path.splitext(output_path)[0] + "_depth.mkv"
     depth_output_path_tmp = path.join(path.dirname(depth_output_path), "_tmp_" + path.basename(depth_output_path))
 
     input_container = av.open(input_path)
@@ -968,10 +968,9 @@ def process_video_dual(input_path, output_path,
         config.video_codec = VU.get_default_video_codec(config.container_format)
     VU.configure_video_codec(config)
 
-    # Main output container
+    # Keep the main output settings, but always preserve normalized depth losslessly.
     output_container = av.open(output_path_tmp, 'w', options=config.container_options)
-    # Depth output container (assume same options for now, but maybe different codec)
-    depth_output_container = av.open(depth_output_path_tmp, 'w', options=config.container_options)
+    depth_output_container = av.open(depth_output_path_tmp, 'w', format="matroska")
 
     fps_filter = VU.FixedFPSFilter(video_input_stream, fps=config.fps, vf=vf)
     
@@ -1024,41 +1023,25 @@ def process_video_dual(input_path, output_path,
     video_output_stream.width = output_size[0]
     video_output_stream.height = output_size[1]
     video_output_stream.options = config.options
-    
-    # Setup Depth Stream
-    # Use same codec and settings
-    depth_output_stream = depth_output_container.add_stream(config.video_codec, output_fps)
-    # Reuse config but changing size
-    VU.configure_colorspace(depth_output_stream, video_input_stream, config)
-    depth_output_stream.thread_type = "AUTO"
-    depth_output_stream.pix_fmt = config.pix_fmt
-    depth_output_stream.width = depth_output_size[0]
-    depth_output_stream.height = depth_output_size[1]
-    depth_output_stream.options = config.options
 
     rgb24_options = config.state["rgb24_options"]
     reformatter_main = config.state["reformatter"]
-    # We need a secondary reformatter for depth stream (same settings)
-    reformatter_depth = config.state["reformatter"] # lambda that captures closure vars, correct?
-    # Actually `configure_colorspace` modifies `config.state["reformatter"]`.
-    # It depends on output_stream context (dst_colorspace etc). 
-    # Since we set main stream and depth stream identically (same config used in configure_colorspace called twice?), 
-    # NO. `configure_colorspace` sets the lambda based on `output_stream.codec_context`.
-    # If we call it for `depth_output_stream`, it will update `config.state["reformatter"]` to point to depth stream context.
-    # So we need to capture `reformatter_main` BEFORE configuring depth stream, or make sure they are compatible.
-    # Since they have same settings, the lambda should work for both IF it doesn't close over `output_stream` instance but values.
-    # Looking at `configure_colorspace`:
-    # reformatter = lambda frame: frame.reformat(..., dst_colorspace=output_stream.codec_context.colorspace, ...)
-    # It uses `output_stream`! So we need two reformatters.
-    
-    # Re-setup reformatter for depth. config.state is overwritten.
-    # So we save `reformatter_main` first.
-    # Actually I realized I called `configure_colorspace` twice above with `config`.
-    # First for `video_output_stream`. config.state contains main reformatter.
-    reformatter_main = config.state["reformatter"]
-    
-    # Second for `depth_output_stream`. config.state updated.
-    reformatter_depth = config.state["reformatter"]
+
+    # Depth is normalized data, not display RGB. Avoid RGB color conversion and
+    # preserve the full [0, 65535] range independently of the main video codec.
+    depth_output_stream = depth_output_container.add_stream("ffv1", output_fps)
+    depth_output_stream.thread_type = "AUTO"
+    depth_output_stream.pix_fmt = "gray16le"
+    depth_output_stream.width = depth_output_size[0]
+    depth_output_stream.height = depth_output_size[1]
+    depth_output_stream.options = {"level": "3"}
+
+    def reformatter_depth(frame):
+        return frame.reformat(
+            width=depth_output_size[0],
+            height=depth_output_size[1],
+            format="gray16le",
+        )
 
     # Audio for main stream
     audio_output_stream = None
