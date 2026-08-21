@@ -123,6 +123,74 @@ def warp(batch, width, height, c, x_index, index_shift, src_index, index_order):
     return out
 
 
+def warp_coverage(batch, width, height, premultiplied, x_index, index_shift, src_index, index_order):
+    """Depth-ordered bilinear splat that preserves absolute source coverage."""
+    floor_index, ceil_index, floor_weight, ceil_weight = make_bilinear_data(
+        batch, width, height, x_index, index_shift)
+
+    undefined_value = torch.zeros(
+        premultiplied.shape[1] + 1,
+        dtype=premultiplied.dtype,
+        device=premultiplied.device)
+    floor_warp = ordered_index_copy(
+        torch.cat([floor_weight, premultiplied], dim=1),
+        src_index, floor_index, index_order, undefined_value=undefined_value)
+    ceil_warp = ordered_index_copy(
+        torch.cat([ceil_weight, premultiplied], dim=1),
+        src_index, ceil_index, index_order, undefined_value=undefined_value)
+
+    floor_weight_warp, floor_warp = floor_warp[:, 0:1], floor_warp[:, 1:]
+    ceil_weight_warp, ceil_warp = ceil_warp[:, 0:1], ceil_warp[:, 1:]
+    absolute = floor_warp * floor_weight_warp + ceil_warp * ceil_weight_warp
+    alpha = torch.clamp(absolute[:, -1:], 0, 1)
+    rgb = torch.where(
+        alpha > 1e-6,
+        absolute[:, :-1] / torch.clamp_min(alpha, 1e-6),
+        torch.zeros_like(absolute[:, :-1]))
+    return torch.cat([torch.clamp(rgb, 0, 1), alpha], dim=1)
+
+
+def depth_order_bilinear_forward_splat(c, alpha, depth, divergence, convergence,
+                                        width_base=True):
+    """Create raw stereo views without normalizing away disocclusion coverage.
+
+    Unlike :func:`depth_order_bilinear_forward_warp`, this function accepts a
+    foreground alpha channel and returns coverage-aware alpha for each eye.
+    Sparse bilinear contributions remain partially covered instead of becoming
+    fully opaque after weight normalization. No hole fixing or filling is done.
+    """
+    assert c.shape[0] == alpha.shape[0]
+    assert c.shape[-2:] == alpha.shape[-2:]
+    if c.shape[2] != depth.shape[2] or c.shape[3] != depth.shape[3]:
+        depth = F.interpolate(depth, size=c.shape[-2:],
+                              mode="bilinear", align_corners=True, antialias=True)
+
+    base_size = c.shape[-1] if width_base else max(c.shape[-2:])
+    padding_size = int(base_size * divergence * 0.01 + 2)
+    pad = ReplicationPad2d((padding_size, padding_size, 0, 0))
+    unpad = ReplicationPad2d((-padding_size, -padding_size, 0, 0))
+    c = pad(c)
+    alpha = F.pad(alpha, (padding_size, padding_size, 0, 0), value=0)
+    depth = pad(depth)
+
+    B, _, H, W = depth.shape
+    shift_size = divergence * 0.01 * base_size * 0.5
+    index_shift = (depth * shift_size - shift_size * convergence).view(B, H, W)
+    x_index = torch.arange(0, W, device=c.device).view(1, 1, W).expand(B, H, W)
+    src_index = to_flat_index(B, W, H, x_index)
+    index_order = torch.argsort(depth.view(-1), dim=0)
+    premultiplied = torch.cat([c * alpha, alpha], dim=1)
+
+    left = warp_coverage(B, W, H, premultiplied, x_index, index_shift,
+                         src_index, index_order)
+    right = warp_coverage(B, W, H, premultiplied, x_index, -index_shift,
+                          src_index, index_order)
+    left = unpad(left)
+    right = unpad(right)
+    return (left[:, :-1].contiguous(), right[:, :-1].contiguous(),
+            left[:, -1:].contiguous(), right[:, -1:].contiguous())
+
+
 def gen_mask2(mask):
     mask = mask[:, 0:1]
     return torch.clamp((mask == -1).float() + (mask == -2).float() * 0.5, 0, 1)
