@@ -142,11 +142,12 @@ def warp_coverage(batch, width, height, premultiplied, x_index, index_shift, src
     floor_weight_warp, floor_warp = floor_warp[:, 0:1], floor_warp[:, 1:]
     ceil_weight_warp, ceil_warp = ceil_warp[:, 0:1], ceil_warp[:, 1:]
     absolute = floor_warp * floor_weight_warp + ceil_warp * ceil_weight_warp
-    alpha = torch.clamp(absolute[:, -1:], 0, 1)
+    alpha_sum = absolute[:, -1:]
     rgb = torch.where(
-        alpha > 1e-6,
-        absolute[:, :-1] / torch.clamp_min(alpha, 1e-6),
+        alpha_sum > 1e-6,
+        absolute[:, :-1] / torch.clamp_min(alpha_sum, 1e-6),
         torch.zeros_like(absolute[:, :-1]))
+    alpha = torch.clamp(alpha_sum, 0, 1)
     return torch.cat([torch.clamp(rgb, 0, 1), alpha], dim=1)
 
 

@@ -35,6 +35,20 @@ class ForwardWarpCoverageTest(unittest.TestCase):
         self.assertTrue(((left_alpha > 0) & (left_alpha < 0.99)).any())
         self.assertTrue(((right_alpha > 0) & (right_alpha < 0.99)).any())
 
+    def test_overlap_does_not_brighten_rgb(self):
+        width = 16
+        color = torch.tensor([0.2, 0.4, 0.6], dtype=torch.float32)
+        rgb = color.view(1, 3, 1, 1).expand(1, 3, 1, width).clone()
+        alpha = torch.ones((1, 1, 1, width), dtype=torch.float32)
+        depth = torch.linspace(1, 0, width).view(1, 1, 1, width)
+
+        left_rgb, _, left_alpha, _ = depth_order_bilinear_forward_splat(
+            rgb, alpha, depth, divergence=50, convergence=0.5)
+
+        visible = left_alpha.expand_as(left_rgb) > 0
+        expected = color.view(1, 3, 1, 1).expand_as(left_rgb)
+        torch.testing.assert_close(left_rgb[visible], expected[visible])
+
     def test_does_not_fill_disocclusion_holes(self):
         width = 16
         rgb = torch.ones((1, 3, 1, width), dtype=torch.float32)
