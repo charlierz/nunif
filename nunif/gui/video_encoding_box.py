@@ -23,17 +23,17 @@ CODEC_ALL = ["libx264", "libopenh264", "libx265", "utvideo", "ffv1",
              "h264_nvenc", "hevc_nvenc",
              "h264_qsv", "hevc_qsv"]
 
-PIX_FMT_ALL = ["yuv420p", "yuv444p", "yuv420p10le", "rgb24", "gbrp10le", "gbrp16le"]
+PIX_FMT_ALL = ["yuv420p", "yuv422p", "yuv444p", "yuv420p10le", "rgb24", "gbrp10le", "gbrp16le"]
 CODEC_PIX_FMT = {
-    "libx264": ["yuv420p", "yuv444p", "yuv420p10le", "rgb24", "gbrp10le"],
-    "libx265": ["yuv420p", "yuv444p", "yuv420p10le", "rgb24", "gbrp10le"],
+    "libx264": ["yuv420p", "yuv422p", "yuv444p", "yuv420p10le", "rgb24", "gbrp10le"],
+    "libx265": ["yuv420p", "yuv422p", "yuv444p", "yuv420p10le", "rgb24", "gbrp10le"],
     "h264_nvenc": ["yuv420p", "yuv444p", "yuv420p10le", "rgb24", "gbrp16le"],
     "hevc_nvenc": ["yuv420p", "yuv444p", "yuv420p10le", "rgb24", "gbrp16le"],
     "h264_qsv": ["yuv420p"],
     "hevc_qsv": ["yuv420p", "yuv420p10le"],
     "libopenh264": ["yuv420p"],
-    "utvideo": ["yuv420p", "yuv444p", "rgb24"],
-    "ffv1": ["yuv420p", "yuv444p", "yuv420p10le", "rgb24", "gbrp16le"],
+    "utvideo": ["yuv420p", "yuv422p", "yuv444p", "rgb24"],
+    "ffv1": ["yuv420p", "yuv422p", "yuv444p", "yuv420p10le", "rgb24", "gbrp16le"],
 }
 
 
