@@ -750,8 +750,10 @@ def attach_video_depth(frame, depth, args):
 
 
 class VideoDepthWriter:
-    def __init__(self, output_path):
-        self.output_path = path.splitext(output_path)[0] + "_depth.mkv"
+    def __init__(self, output_path, exact_output=False):
+        self.output_path = (
+            output_path if exact_output else path.splitext(output_path)[0] + "_depth.mkv"
+        )
         self.temporary_path = path.join(
             path.dirname(self.output_path), "_tmp_" + path.basename(self.output_path)
         )
@@ -1102,6 +1104,73 @@ def bind_batch_frame_callback(depth_model, side_model, segment_pts, args):
     return _cuda_stream_wrapper, _preprocess
 
 
+def process_vda_depth_only(input_filename, output_filename, depth_model, segment_pts, args):
+    """Write normalized VDA depth without constructing or encoding stereo frames."""
+    if args.vf or args.autocrop is not None or args.start_time is not None or args.end_time is not None:
+        raise ValueError(
+            "--video-depth-only currently requires an unfiltered, untrimmed input"
+        )
+
+    writer = VideoDepthWriter(output_filename, exact_output=True)
+    batch_queue = []
+    pts_queue = []
+    frame_count = 0
+
+    def write_depths(depths):
+        nonlocal frame_count
+        for depth in depths:
+            writer.write(VU.OffloadFrame(depth, dtype=torch.uint16))
+            frame_count += 1
+
+    def infer_batch():
+        if not batch_queue:
+            return
+        depths = depth_model.infer_with_normalize(
+            torch.stack(batch_queue),
+            pts_queue.copy(),
+            segment_pts,
+            enable_amp=not args.disable_amp,
+            edge_dilation=args.edge_dilation,
+            depth_aa=args.depth_aa,
+        )
+        batch_queue.clear()
+        pts_queue.clear()
+        write_depths(depths)
+
+    try:
+        with av.open(input_filename, mode="r", metadata_errors="ignore") as container:
+            stream = container.streams.video[0]
+            fps = stream.average_rate or stream.base_rate
+            if fps is None:
+                raise ValueError("Cannot determine input FPS")
+            if float(fps) > args.max_fps:
+                raise ValueError(
+                    "--video-depth-only requires --max-fps at least the input FPS"
+                )
+            writer.set_fps(fps)
+            depth_model.reset()
+            for frame in container.decode(stream):
+                batch_queue.append(VU.to_tensor(frame, device=args.state["device"]))
+                pts_queue.append(frame.pts)
+                if len(batch_queue) == args.batch_size:
+                    infer_batch()
+            infer_batch()
+            write_depths(
+                depth_model.flush_with_normalize(
+                    enable_amp=not args.disable_amp,
+                    edge_dilation=args.edge_dilation,
+                    depth_aa=args.depth_aa,
+                )
+            )
+    except BaseException:
+        writer.close(success=False)
+        raise
+    if frame_count == 0:
+        writer.close(success=False)
+        raise RuntimeError("VDA depth-only processing produced no frames")
+    writer.close(success=True)
+
+
 def bind_vda_frame_callback(depth_model, side_model, segment_pts, args):
     src_queue = []
     batch_queue = []
@@ -1306,6 +1375,14 @@ def process_video_full(input_filename, output_path, args, depth_model, side_mode
     else:
         segment_pts = set()
     if args.scene_detect_only:
+        return
+
+    if args.video_depth_only:
+        if not is_video_depth_anything:
+            raise ValueError("--video-depth-only requires a VDA depth model")
+        process_vda_depth_only(
+            input_filename, output_filename, depth_model, segment_pts, args
+        )
         return
 
     if args.autocrop is not None:
@@ -2425,6 +2502,8 @@ def create_parser(required_true=True):
                         help=("output only depth image and omits rgb image"))
     parser.add_argument("--video-depth", action="store_true",
                         help="output normalized depth as a synchronized lossless gray16 MKV sidecar")
+    parser.add_argument("--video-depth-only", action="store_true",
+                        help="output only normalized VDA depth as a lossless gray16 MKV")
     parser.add_argument("--export-depth-fit", action="store_true",
                         help=("fit depth image size to rgb image"))
     parser.add_argument("--mapper", type=str,
@@ -2579,6 +2658,10 @@ def set_state_args(args, stop_event=None, tqdm_fn=None, depth_model=None, suspen
         raise ValueError("--export-depth-only must be specified together with --export or --export-disparity")
     if args.export_depth_fit and not args.export:
         raise ValueError("--export-depth-fit must be specified together with --export or --export-disparity")
+    if args.video_depth_only:
+        args.video_depth = False
+        if args.video_format != "mkv" and path.splitext(args.output)[-1] != ".mkv":
+            raise ValueError("--video-depth-only requires MKV output")
 
     if depth_model.get_name() == "VideoDepthAnything":
         if not args.ema_normalize:
@@ -2729,7 +2812,7 @@ def iw3_main(args):
         export_main(args)
         return args
 
-    side_model = create_stereo_model(
+    side_model = None if args.video_depth_only else create_stereo_model(
         args.method,
         divergence=args.divergence * (2.0 if args.synthetic_view in {"right", "left"} else 1.0),
         device_id=args.gpu[0],

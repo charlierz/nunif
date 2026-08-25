@@ -41,6 +41,17 @@ class VideoDepthWriterTest(unittest.TestCase):
                         expected,
                     )
 
+    def test_exact_output_path_for_depth_only_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "depth.mkv"
+            writer = utils.VideoDepthWriter(str(output), exact_output=True)
+            writer.set_fps(48)
+            writer.write(OffloadFrame(torch.zeros((1, 2, 2)), dtype=torch.uint16))
+            writer.close(success=True)
+
+            self.assertTrue(output.exists())
+            self.assertFalse(output.with_name("depth_depth.mkv").exists())
+
     def test_failed_output_removes_temporary_sidecar(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "stereo.mp4"
